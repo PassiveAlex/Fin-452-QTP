@@ -1,7 +1,7 @@
-# TODO — Fin-452 QTP: Sector Rotation via Kalman-Filtered K-Means Clustering
+# TODO — Fin-452 QTP: Sector Rotation via Kalman-Filtered Hierarchical Clustering
 
 ## Strategy Summary
-Long/short sector rotation across 11 SPDR Select Sector ETFs. Kalman filter smooths each ETF's return series; K-means clusters sectors monthly by filtered momentum/vol features; long the best cluster, short the worst. Benchmarked against SPY.
+Long/short sector rotation across 11 SPDR Select Sector ETFs. Kalman filter smooths each ETF's return series; agglomerative hierarchical clustering (Ward's D2 linkage) groups sectors monthly by filtered momentum/vol features; long the best cluster, short the worst. Benchmarked against SPY.
 
 ---
 
@@ -47,9 +47,18 @@ Long/short sector rotation across 11 SPDR Select Sector ETFs. Kalman filter smoo
 ---
 
 ## 4. Clustering
-- [ ] Write `run_kmeans_rotation(feature_matrix, k)` — use `nstart = 25` for stability
-- [ ] Write `label_clusters(assignments, centers)` — deterministic labeling by 1m momentum score
-  - Highest center 1m return → "long", Lowest → "short", rest → "neutral"
+- [ ] Write `run_hclust_rotation(feature_matrix, n_clusters, linkage)` using base R `hclust()`
+  - Compute distance matrix: `dist(feature_matrix, method = "euclidean")`
+  - Fit: `hclust(d, method = linkage)` — default linkage: `"ward.D2"`
+  - Cut tree: `cutree(h, k = n_clusters)` → named integer vector of assignments
+  - Other linkage options to test in optimization: `"complete"`, `"average"`, `"single"`
+- [ ] Write `label_clusters(assignments, feature_matrix)` — deterministic labeling by 1m momentum score
+  - Compute each cluster's mean 1m-return feature across its members
+  - Highest mean → "long", Lowest mean → "short", rest → "neutral"
+  - This is more stable than using k-means centers since assignments are deterministic
+- [ ] Plot dendrogram at a representative rebalance date using `factoextra::fviz_dend()`
+  - Highlight clusters with colored branches and rectangles (`rect = TRUE`)
+  - Include as a one-time illustration of the clustering structure
 - [ ] Visualize cluster assignments over time as a sector allocation heatmap
   - X: rebal date, Y: sector ETF, color: long (green) / short (red) / neutral (gray)
 
@@ -90,14 +99,15 @@ Long/short sector rotation across 11 SPDR Select Sector ETFs. Kalman filter smoo
 
 ## 9. Optimization
 - [ ] Define parameter grid:
-  - `k` (clusters): 2–5
+  - `n_clusters`: 2–5
+  - `linkage`: `"ward.D2"`, `"complete"`, `"average"`
   - `H_mult`: 0.5, 1.0, 2.0, 5.0
   - `Q_mult`: 0.1, 0.5, 1.0, 2.0
   - Feature horizon sets: 3 variants
-- [ ] Pre-compute 16 Kalman filter variants (4×4 H/Q) before parallel loop
+- [ ] Pre-compute 16 Kalman filter variants (4×4 H/Q) before parallel loop — hierarchical clustering is deterministic so no random seed concern
 - [ ] Parallel grid search with `foreach` + `doParallel` — maximize Sharpe on training set
 - [ ] Report top-10 parameter sets
-- [ ] Sensitivity surface plots (heatmap: k vs H_mult, etc.)
+- [ ] Sensitivity surface plots (heatmap: n_clusters vs linkage, H_mult vs Q_mult, etc.)
 - [ ] Re-run with optimized parameters, compare to baseline
 
 ---
@@ -118,3 +128,6 @@ Long/short sector rotation across 11 SPDR Select Sector ETFs. Kalman filter smoo
 - SPY is benchmark only — never enters the cluster universe
 - XLC/XLRE must not appear before their inception dates — verify in output
 - If training Sharpe is suspiciously high (>5), check for look-ahead bias in Kalman usage
+- Hierarchical clustering is deterministic (no random init) — a key advantage over k-means; no `set.seed()` needed per rebalance
+- Ward's D2 linkage minimizes within-cluster variance (most analogous to k-means objective); good default
+- With only 9–11 ETFs, cluster structure can be fragile — dendrogram cut height sensitivity matters more than with large datasets
