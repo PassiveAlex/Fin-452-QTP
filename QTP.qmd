@@ -1,0 +1,922 @@
+---
+title: "Fin-452-QTP"
+author: "Alex Hirtle"
+editor: visual
+format:
+  html:
+    embedd-resource: true
+    self-contained: true
+---
+```{r, "Libraries"}
+library(tidyverse)
+library(tidyquant)
+library(PerformanceAnalytics)
+library(cluster)
+library(gt)
+library(slider)
+library(doParallel)
+library(dlm)
+library(purrr)
+library(patchwork)
+```
+
+
+```{r, "Pulling Data"}
+tickers <- c("SPY", "XLB", "XLC", "XLE",
+             "XLF", "XLI", "XLK", "XLP",
+             "XLRE", "XLV", "XLU", "XLY")
+
+fromdate <- "2000-06-01"
+todate   <- "2026-02-28"
+
+raw_data   <- tq_get(tickers, get = "stock.prices", from = fromdate, to = todate) %>%
+  stats::na.omit()
+train_data <- raw_data %>% dplyr::filter(date <= "2024-12-31")
+test_data  <- raw_data %>% dplyr::filter(date >= "2025-01-01")
+```
+
+```{r, "Returns"}
+# Adds OpCl, ClCl, ClOp log returns to the df per symbol.
+add_returns <- function(dat) {
+  dat %>%
+    dplyr::group_by(symbol) %>%
+    dplyr::mutate(
+      OpCl = (close / open) - 1,
+      ClCl = (close / dplyr::lag(close)) - 1,
+      ClOp = (open  / dplyr::lag(close)) - 1
+    ) %>%
+    stats::na.omit() %>%
+    dplyr::ungroup()
+}
+
+train_df <- add_returns(train_data)
+test_df  <- add_returns(test_data)
+
+write.csv(test_df, "Testing_DF_Returns")
+```
+
+```{r, "Rolling Stats"}
+# Adds rolling mean (short + long for MA crossover), vol, vol-of-vol,
+# volume mean, Sharpe, Sortino, momentum, SPY correlation, and max drawdown.
+#
+# When `window` is supplied it acts as a global override: all stats use that
+# window, and mean_windows is automatically set to c(round(window/4), window)
+# to produce both the short and long MA required for the crossover signal.
+# Individual window arguments are ignored when `window` is set.
+#
+# Args:
+#   dat              : Grouped or ungrouped df with symbol, date, ClCl,
+#                      volume columns. Must contain "SPY" for corr stats.
+#   window           : Global window override (integer). Short MA = round(window/4).
+#   mean_windows     : Windows for rolling mean of ClCl. Ignored if window set.
+#   vol_windows      : Windows for rolling vol (sd of ClCl).
+#   vol_of_vol_windows: Outer windows for rolling sd of the base vol series.
+#   vol_base_window  : Inner window for VoV base. Defaults to vol_windows[1].
+#   volume_windows   : Windows for rolling mean of share volume.
+#   sharpe_windows   : Windows for rolling annualised Sharpe.
+#   sortino_windows  : Windows for rolling annualised Sortino.
+#   momentum_windows : Windows for cumulative compound return.
+#   corr_windows     : Windows for rolling Pearson correlation to SPY.
+#   drawdown_windows : Windows for rolling max drawdown.
+#   rf_daily         : Daily risk-free rate for Sharpe/Sortino. Default 0.
+#
+# Returns:
+#   df with all rolling columns appended, ungrouped.
+#   Rows without a full window are NA — no look-forward bias.
+
+add_rollers <- function(
+  dat,
+  window              = NULL,
+  mean_windows        = c(20, 252),
+  vol_windows         = c(20, 60),
+  vol_of_vol_windows  = c(60),
+  vol_base_window     = NULL,
+  volume_windows      = c(20),
+  sharpe_windows      = c(20, 60),
+  sortino_windows     = c(20, 60),
+  momentum_windows    = c(20, 60, 252),
+  corr_windows        = c(60),
+  drawdown_windows    = c(60),
+  rf_daily            = 0
+) {
+
+  # If global window supplied, override all individual window params.
+  # Short MA = window / 4 (1:4 ratio) for the crossover signal.
+  if (!is.null(window)) {
+    short_w            <- max(2L, round(window / 4L))
+    mean_windows       <- c(short_w, window)
+    vol_windows        <- window
+    vol_of_vol_windows <- window
+    volume_windows     <- window
+    sharpe_windows     <- window
+    sortino_windows    <- window
+    momentum_windows   <- window
+    corr_windows       <- window
+    drawdown_windows   <- window
+  }
+
+  # ---------------------------------------------------------------------------
+  # Internal helpers
+  # Args: x = series, w = window, f = function, y = second series (corr only)
+  # ---------------------------------------------------------------------------
+
+  # Right-aligned rolling apply; NA until full window is available.
+  roll_scalar <- function(x, w, f) {
+    slider::slide_dbl(x, f, .before = w - 1, .complete = TRUE)
+  }
+
+  # Rolling Pearson correlation between two parallel vectors.
+  roll_corr <- function(x, y, w) {
+    slider::slide2_dbl(x, y,
+      ~ cor(.x, .y, use = "complete.obs"),
+      .before = w - 1, .complete = TRUE)
+  }
+
+  # Annualised Sharpe (252-day). NA when sd = 0.
+  sharpe_fn <- function(x, rf) {
+    excess <- x - rf
+    s <- sd(excess, na.rm = TRUE)
+    if (is.na(s) || s == 0) return(NA_real_)
+    sqrt(252) * mean(excess, na.rm = TRUE) / s
+  }
+
+  # Annualised Sortino; downside deviation = sqrt(mean(min(r, 0)^2)).
+  sortino_fn <- function(x, rf) {
+    excess <- x - rf
+    dd <- sqrt(mean(pmin(excess, 0)^2, na.rm = TRUE))
+    if (is.na(dd) || dd == 0) return(NA_real_)
+    sqrt(252) * mean(excess, na.rm = TRUE) / dd
+  }
+
+  # Max drawdown over the window as a negative fraction.
+  mdd_fn <- function(x) {
+    cr   <- cumprod(1 + x)
+    peak <- cummax(cr)
+    min((cr - peak) / peak, na.rm = TRUE)
+  }
+
+  # Cumulative compound return.
+  momentum_fn <- function(x) prod(1 + x, na.rm = TRUE) - 1
+
+  # ---------------------------------------------------------------------------
+  # Prepare: join SPY ClCl for correlation, group by symbol, sort by date.
+  # ---------------------------------------------------------------------------
+  spy_series <- dat %>%
+    dplyr::filter(symbol == "SPY") %>%
+    dplyr::arrange(date) %>%
+    dplyr::select(date, spy_ClCl = ClCl)
+
+  dat <- dat %>%
+    dplyr::left_join(spy_series, by = "date") %>%
+    dplyr::group_by(symbol) %>%
+    dplyr::arrange(date, .by_group = TRUE)
+
+  # Rolling means (produces mean_<short>d and mean_<long>d when window set)
+  for (w in mean_windows) {
+    nm  <- paste0("mean_", w, "d")
+    dat <- dat %>%
+      dplyr::mutate(!!nm := roll_scalar(ClCl, w, ~ mean(.x, na.rm = TRUE)))
+  }
+
+  # Rolling volatility (sd of ClCl)
+  for (w in vol_windows) {
+    nm  <- paste0("vol_", w, "d")
+    dat <- dat %>%
+      dplyr::mutate(!!nm := roll_scalar(ClCl, w, ~ sd(.x, na.rm = TRUE)))
+  }
+
+  # Volatility of volatility: rolling sd of the base vol series
+  base_w       <- if (!is.null(vol_base_window)) vol_base_window else vol_windows[1]
+  base_vol_col <- paste0("vol_", base_w, "d")
+
+  for (w in vol_of_vol_windows) {
+    nm  <- paste0("vov_", base_w, "d_", w, "d")
+    dat <- dat %>%
+      dplyr::mutate(!!nm := roll_scalar(.data[[base_vol_col]], w, ~ sd(.x, na.rm = TRUE)))
+  }
+
+  # Rolling mean of share volume
+  for (w in volume_windows) {
+    nm  <- paste0("volume_mean_", w, "d")
+    dat <- dat %>%
+      dplyr::mutate(!!nm := roll_scalar(volume, w, ~ mean(.x, na.rm = TRUE)))
+  }
+
+  # Rolling Sharpe ratio (annualised)
+  for (w in sharpe_windows) {
+    nm  <- paste0("sharpe_", w, "d")
+    dat <- dat %>%
+      dplyr::mutate(!!nm := roll_scalar(ClCl, w, ~ sharpe_fn(.x, rf_daily)))
+  }
+
+  # Rolling Sortino ratio (annualised)
+  for (w in sortino_windows) {
+    nm  <- paste0("sortino_", w, "d")
+    dat <- dat %>%
+      dplyr::mutate(!!nm := roll_scalar(ClCl, w, ~ sortino_fn(.x, rf_daily)))
+  }
+
+  # Rolling momentum (cumulative compound return)
+  for (w in momentum_windows) {
+    nm  <- paste0("momentum_", w, "d")
+    dat <- dat %>%
+      dplyr::mutate(!!nm := roll_scalar(ClCl, w, momentum_fn))
+  }
+
+  # Rolling correlation to SPY
+  for (w in corr_windows) {
+    nm  <- paste0("corr_spy_", w, "d")
+    dat <- dat %>%
+      dplyr::mutate(!!nm := roll_corr(ClCl, spy_ClCl, w))
+  }
+
+  # Rolling max drawdown
+  for (w in drawdown_windows) {
+    nm  <- paste0("mdd_", w, "d")
+    dat <- dat %>%
+      dplyr::mutate(!!nm := roll_scalar(ClCl, w, mdd_fn))
+  }
+
+  dat %>%
+    dplyr::select(-spy_ClCl) %>%
+    dplyr::ungroup()
+}
+```
+
+```{r, "Kalman Smoothing"}
+# Applies a local-level Kalman filter to every rolling stat column.
+# Each series is normalised to zero mean / unit variance before filtering
+# so that the same dV and dW are meaningful across all columns regardless
+# of scale differences (e.g. returns vs Sharpe ratios vs volume).
+#
+# Local level model:
+#   mu_t = mu_{t-1} + w_t,   w_t ~ N(0, dW)   state evolves as random walk
+#   y_t  = mu_t    + v_t,   v_t ~ N(0, dV)   observation = state + noise
+#
+# The ratio dW/dV controls smoothing:
+#   Low  dW/dV → state changes slowly → heavy smoothing
+#   High dW/dV → state changes quickly → light smoothing, tracks data closely
+#
+# dV is fixed at 1 (only the ratio matters after normalisation).
+# The filter is strictly causal — no look-forward bias.
+#
+# Args:
+#   dat : df output from add_rollers. Must have symbol and date columns.
+#   dW  : State noise variance. The key sensitivity-analysis parameter.
+#   dV  : Observation noise variance. Fixed at 1; series are pre-normalised.
+#
+# Returns:
+#   dat with rolling stat columns replaced by their Kalman-filtered versions.
+
+kalman_smooth_all <- function(dat, dW, dV = 1) {
+
+  # Columns that should NOT be filtered (raw prices, returns, identifiers)
+  raw_cols <- c("symbol", "date", "open", "high", "low", "close",
+                "volume", "adjusted", "OpCl", "ClCl", "ClOp")
+
+  feature_cols <- setdiff(names(dat), raw_cols)
+  feature_cols <- feature_cols[vapply(dat[feature_cols], is.numeric, logical(1))]
+
+  local_level <- dlm::dlmModPoly(order = 1, dV = dV, dW = dW)
+
+  # Filter a single numeric vector: normalise → Kalman filter → denormalise.
+  filter_series <- function(x) {
+    valid <- which(is.finite(x))
+    if (length(valid) < 10) return(x)  # too few points to filter meaningfully
+
+    x_sub  <- x[valid]
+    x_mean <- mean(x_sub)
+    x_sd   <- sd(x_sub)
+
+    if (is.na(x_sd) || x_sd == 0) return(x)  # constant series; nothing to smooth
+
+    x_norm   <- (x_sub - x_mean) / x_sd
+    filtered <- tryCatch(
+      dlm::dlmFilter(x_norm, local_level),
+      error = function(e) NULL
+    )
+    if (is.null(filtered)) return(x)
+
+    # filtered$m is T+1 rows; row 1 = prior. Rows 2:(T+1) = filtered states.
+    x_smooth     <- as.numeric(filtered$m[-1])
+    result       <- x
+    result[valid] <- x_smooth * x_sd + x_mean
+    result
+  }
+
+  dat %>%
+    dplyr::group_by(symbol) %>%
+    dplyr::arrange(date, .by_group = TRUE) %>%
+    dplyr::mutate(dplyr::across(dplyr::all_of(feature_cols), filter_series)) %>%
+    dplyr::ungroup()
+}
+```
+
+```{r, "Monthly Snapshots"}
+# Extracts the last trading day of each calendar month per symbol.
+# These are the rebalancing observation points — all clustering and signal
+# logic operates on this reduced dataframe.
+#
+# Args:
+#   dat : Daily returns df with symbol and date columns.
+#
+# Returns:
+#   df with one row per symbol per month-end date.
+
+get_monthly_snapshots <- function(dat) {
+  dat %>%
+    dplyr::mutate(.ym = format(date, "%Y-%m")) %>%
+    dplyr::group_by(symbol, .ym) %>%
+    dplyr::filter(date == max(date)) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(-.ym)
+}
+```
+
+```{r, "Clustering"}
+# evaluate_k: compares cluster quality across multiple K values using
+# within-cluster sum of squares (elbow method) and average silhouette width.
+# Run this once on the full snapshot history to inform K selection before
+# committing to a value for the backtest.
+#
+# Args:
+#   snapshot_dat  : Monthly snapshot df from get_monthly_snapshots.
+#   k_values      : Integer vector of K values to evaluate.
+#   feature_cols  : Column names to use as clustering features. Defaults to
+#                   momentum, vol, sharpe, and corr_spy columns (auto-detected).
+#
+# Returns:
+#   List with $metrics (df), $p_elbow (ggplot), $p_sil (ggplot),
+#   $dendrogram (hclust object for plotting).
+
+evaluate_k <- function(snapshot_dat, k_values = 2:6, feature_cols = NULL) {
+
+  if (is.null(feature_cols)) {
+    feature_cols <- names(snapshot_dat)[
+      grepl("^(momentum_|vol_[0-9]|sharpe_|corr_spy_)", names(snapshot_dat))
+    ]
+  }
+
+  # Build stable sector profiles: mean feature value per sector across all dates.
+  feat_mat <- snapshot_dat %>%
+    dplyr::group_by(symbol) %>%
+    dplyr::summarise(
+      dplyr::across(dplyr::all_of(feature_cols), ~ mean(.x, na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    tibble::column_to_rownames("symbol") %>%
+    scale()  # normalise before distance calculation
+
+  dist_mat   <- dist(feat_mat, method = "euclidean")
+  hclust_fit <- hclust(dist_mat, method = "ward.D2")
+
+  metrics <- purrr::map_dfr(k_values, function(k) {
+    assignments <- cutree(hclust_fit, k = k)
+
+    # Within-cluster sum of squares
+    wcss <- sum(vapply(unique(assignments), function(cl) {
+      members <- feat_mat[assignments == cl, , drop = FALSE]
+      if (nrow(members) < 2) return(0)
+      sum(apply(members, 2, var) * (nrow(members) - 1))
+    }, numeric(1)))
+
+    # Average silhouette width (requires >= 2 clusters with >= 2 members)
+    sil <- tryCatch(
+      mean(cluster::silhouette(assignments, dist_mat)[, "sil_width"]),
+      error = function(e) NA_real_
+    )
+
+    data.frame(k = k, wcss = wcss, avg_silhouette = sil)
+  })
+
+  p_elbow <- ggplot2::ggplot(metrics, ggplot2::aes(x = k, y = wcss)) +
+    ggplot2::geom_line() + ggplot2::geom_point(size = 3) +
+    ggplot2::labs(title = "Elbow Method — Within-Cluster SS",
+                  x = "K", y = "WCSS") +
+    ggplot2::theme_minimal()
+
+  p_sil <- ggplot2::ggplot(metrics, ggplot2::aes(x = k, y = avg_silhouette)) +
+    ggplot2::geom_line() + ggplot2::geom_point(size = 3) +
+    ggplot2::labs(title = "Average Silhouette Width",
+                  x = "K", y = "Silhouette") +
+    ggplot2::theme_minimal()
+
+  list(metrics = metrics, p_elbow = p_elbow, p_sil = p_sil,
+       dendrogram = hclust_fit)
+}
+
+
+# cluster_sectors: assigns cluster labels to all sectors at a single
+# rebalancing date using an expanding window for feature normalisation.
+#
+# Expanding window: all snapshot data up to rebalance_date is used to
+# compute scaling parameters (mean, sd per feature). The current snapshot's
+# feature vectors are then normalised by this history before clustering.
+# This ensures early rebalancing dates have less stable but still unbiased
+# normalisation, which improves as the history grows.
+#
+# Args:
+#   snapshot_dat   : Full monthly snapshot df (all dates, all symbols).
+#   k              : Number of clusters to cut the dendrogram at.
+#   rebalance_date : The month-end date being processed.
+#   feature_cols   : Clustering feature columns. Defaults to momentum,
+#                    vol, sharpe, corr_spy (auto-detected).
+#
+# Returns:
+#   df with columns: symbol, date, cluster.
+
+cluster_sectors <- function(snapshot_dat, k, rebalance_date,
+                             feature_cols = NULL) {
+
+  if (is.null(feature_cols)) {
+    feature_cols <- names(snapshot_dat)[
+      grepl("^(momentum_|vol_[0-9]|sharpe_|corr_spy_)", names(snapshot_dat))
+    ]
+  }
+
+  # Expanding window: all history up to and including rebalance_date
+  history <- snapshot_dat %>% dplyr::filter(date <= rebalance_date)
+
+  # Scaling params from full history across all symbols and dates
+  feat_history <- history %>%
+    dplyr::select(dplyr::all_of(feature_cols)) %>%
+    dplyr::filter(dplyr::if_all(dplyr::everything(), is.finite))
+
+  feat_means <- colMeans(feat_history, na.rm = TRUE)
+  feat_sds   <- apply(feat_history, 2, sd, na.rm = TRUE)
+
+  # Current snapshot feature matrix for this rebalance date
+  current <- snapshot_dat %>%
+    dplyr::filter(date == rebalance_date) %>%
+    dplyr::select(symbol, dplyr::all_of(feature_cols))
+
+  if (nrow(current) == 0) return(NULL)
+
+  feat_mat <- current %>%
+    tibble::column_to_rownames("symbol") %>%
+    as.matrix()
+
+  # Apply history-derived scaling
+  for (col in feature_cols) {
+    if (!is.na(feat_sds[col]) && feat_sds[col] > 0) {
+      feat_mat[, col] <- (feat_mat[, col] - feat_means[col]) / feat_sds[col]
+    }
+  }
+  feat_mat[!is.finite(feat_mat)] <- 0  # replace any residual NA/Inf
+
+  dist_mat    <- dist(feat_mat, method = "euclidean")
+  hclust_fit  <- hclust(dist_mat, method = "ward.D2")
+  assignments <- cutree(hclust_fit, k = k)
+
+  data.frame(
+    symbol  = names(assignments),
+    date    = rebalance_date,
+    cluster = as.integer(assignments),
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+```{r, "Signals"}
+# generate_signals: computes a continuous composite signal per sector per
+# rebalancing date.
+#
+# Composite = MA_signal × cluster_confirmation × (1 / vol)
+#
+#   MA_signal            = (short_MA - long_MA) / |long_MA + epsilon|
+#                          Continuous magnitude: positive = bullish trend,
+#                          negative = bearish trend.
+#   cluster_confirmation = fraction of cluster peers sharing the same
+#                          signal direction as this sector. Amplifies
+#                          sectors aligned with their cluster; penalises
+#                          contrarian outliers.
+#   inverse_vol          = 1 / rolling_vol.  Higher-vol sectors receive
+#                          proportionally less weight.
+#
+# Args:
+#   snapshot_dat        : Monthly snapshot df with rolling stat columns.
+#   cluster_assignments : df with symbol, date, cluster (from cluster_sectors).
+#   window              : Global window size used in add_rollers. Determines
+#                         which columns are used as short/long MA and vol.
+#
+# Returns:
+#   df with symbol, date, ma_signal, cluster_confirmation, composite, cluster.
+
+generate_signals <- function(snapshot_dat, cluster_assignments, window) {
+
+  short_w   <- max(2L, round(window / 4L))
+  short_col <- paste0("mean_", short_w, "d")
+  long_col  <- paste0("mean_", window, "d")
+  vol_col   <- paste0("vol_", window, "d")
+
+  snapshot_dat %>%
+    dplyr::left_join(cluster_assignments, by = c("symbol", "date")) %>%
+    dplyr::group_by(date) %>%
+    dplyr::mutate(
+      # Continuous MA crossover strength
+      ma_signal = (.data[[short_col]] - .data[[long_col]]) /
+                  (abs(.data[[long_col]]) + 1e-10),
+
+      signal_dir = sign(ma_signal),
+
+      inv_vol = dplyr::if_else(
+        is.na(.data[[vol_col]]) | .data[[vol_col]] <= 0,
+        NA_real_,
+        1 / .data[[vol_col]]
+      )
+    ) %>%
+    # Cluster confirmation requires grouping by cluster within each date
+    dplyr::group_by(date, cluster) %>%
+    dplyr::mutate(
+      # For each sector: fraction of cluster members with the same direction.
+      # sapply over indices so each element compares against its own direction.
+      cluster_confirmation = {
+        dirs <- signal_dir
+        sapply(seq_along(dirs), function(i) mean(dirs == dirs[i], na.rm = TRUE))
+      },
+      composite = ma_signal * cluster_confirmation * inv_vol
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(symbol, date, ma_signal, cluster_confirmation,
+                  composite, cluster)
+}
+
+
+# construct_weights: converts composite scores to dollar-neutral weights.
+#
+# Sectors with positive composite are held long; negative are held short.
+# If all sectors share the same sign (e.g. broad bull market), a median
+# split is used — top half goes long, bottom half goes short — so the
+# portfolio is always dollar-neutral and always making a relative bet.
+#
+# Long weights sum to +1. Short weights sum to -1.
+#
+# Args:
+#   signals_dat : df with symbol, date, composite columns.
+#
+# Returns:
+#   df with symbol, date, weight, composite.
+
+construct_weights <- function(signals_dat) {
+  signals_dat %>%
+    dplyr::group_by(date) %>%
+    dplyr::mutate(
+      # Median split if all composites are same sign (always stay dollar-neutral)
+      med  = median(composite, na.rm = TRUE),
+      is_long = dplyr::case_when(
+        all(composite >= 0, na.rm = TRUE) ~ composite >= med,
+        all(composite <= 0, na.rm = TRUE) ~ composite >= med,
+        TRUE                              ~ composite > 0
+      ),
+
+      long_total  = sum(composite[is_long],          na.rm = TRUE),
+      short_total = sum(abs(composite[!is_long]),     na.rm = TRUE),
+
+      # Long: positive weight proportional to composite score.
+      # Short: negative weight; magnitude proportional to |composite|.
+      weight = dplyr::case_when(
+        is_long  & long_total  > 0 ~  composite / long_total,
+        !is_long & short_total > 0 ~ -abs(composite) / short_total,
+        TRUE                       ~  0
+      )
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(symbol, date, weight, composite)
+}
+```
+
+```{r, "Backtest"}
+# compute_metrics: computes all performance metrics from a daily return vector.
+#
+# Args:
+#   returns  : Numeric vector of daily strategy returns.
+#   rf_daily : Daily risk-free rate. Default 0.
+#
+# Returns:
+#   Named list: sharpe, cum_return, max_drawdown, annual_vol, omega.
+
+compute_metrics <- function(returns, rf_daily = 0) {
+  returns <- returns[is.finite(returns)]
+  if (length(returns) < 20) {
+    return(list(sharpe = NA_real_, cum_return = NA_real_,
+                max_drawdown = NA_real_, annual_vol = NA_real_,
+                omega = NA_real_, returns = returns))
+  }
+
+  excess <- returns - rf_daily
+
+  sharpe     <- sqrt(252) * mean(excess) / sd(excess)
+  cum_return <- prod(1 + returns) - 1
+  annual_vol <- sd(returns) * sqrt(252)
+
+  cumulative   <- cumprod(1 + returns)
+  peak         <- cummax(cumulative)
+  max_drawdown <- min((cumulative - peak) / peak)
+
+  # Omega ratio at threshold = rf_daily
+  gains  <- sum(pmax(returns - rf_daily, 0))
+  losses <- sum(pmax(rf_daily - returns, 0))
+  omega  <- if (losses == 0) Inf else gains / losses
+
+  list(sharpe = sharpe, cum_return = cum_return, max_drawdown = max_drawdown,
+       annual_vol = annual_vol, omega = omega, returns = returns)
+}
+
+
+# run_backtest: full pipeline for a single (window, dW, k) parameter set.
+#
+# Pipeline:
+#   add_rollers → kalman_smooth_all → monthly snapshots →
+#   for each rebalance date: cluster_sectors + generate_signals +
+#   construct_weights → forward-fill weights to daily → compute daily P&L
+#   → compute_metrics
+#
+# SPY is used for computing correlation features but excluded from the
+# trading universe. A 1-day execution lag is applied to avoid same-day
+# execution bias (signals observed at close, executed next day).
+#
+# Args:
+#   dat      : Returns df (train_df or test_df).
+#   window   : Global window size passed to add_rollers.
+#   dW       : Kalman state noise passed to kalman_smooth_all.
+#   k        : Number of clusters for cluster_sectors.
+#   dV       : Kalman observation noise. Fixed at 1.
+#   rf_daily : Daily risk-free rate.
+#
+# Returns:
+#   Output of compute_metrics (named list including the returns vector).
+
+run_backtest <- function(dat, window, dW, k, dV = 1, rf_daily = 0) {
+
+  # Feature engineering — SPY stays in at this stage for corr computation
+  features <- dat %>%
+    add_rollers(window = window, rf_daily = rf_daily) %>%
+    kalman_smooth_all(dW = dW, dV = dV)
+
+  # Clustering features: momentum, vol, sharpe, corr_spy at the given window
+  short_w      <- max(2L, round(window / 4L))
+  feature_cols <- c(
+    paste0("momentum_", window, "d"),
+    paste0("vol_",      window, "d"),
+    paste0("sharpe_",   window, "d"),
+    paste0("corr_spy_", window, "d")
+  )
+
+  # Monthly snapshots — exclude SPY from trading universe
+  snapshots <- features %>%
+    dplyr::filter(symbol != "SPY") %>%
+    get_monthly_snapshots()
+
+  # Only process rebalancing dates where all sectors have valid signals
+  # (i.e., rolling window warmup is complete)
+  long_col    <- paste0("mean_", window, "d")
+  rebal_dates <- snapshots %>%
+    dplyr::group_by(date) %>%
+    dplyr::filter(all(!is.na(.data[[long_col]]))) %>%
+    dplyr::pull(date) %>%
+    unique() %>%
+    sort()
+
+  if (length(rebal_dates) == 0) {
+    warning("No valid rebalancing dates — window may be too large for dataset.")
+    return(compute_metrics(numeric(0)))
+  }
+
+  # Generate signals at each rebalancing date (expanding window clustering)
+  all_signals <- purrr::map_dfr(rebal_dates, function(rd) {
+    clusters <- cluster_sectors(snapshots, k = k,
+                                rebalance_date = rd,
+                                feature_cols = feature_cols)
+    if (is.null(clusters)) return(NULL)
+    generate_signals(
+      snapshot_dat        = snapshots %>% dplyr::filter(date == rd),
+      cluster_assignments = clusters,
+      window              = window
+    )
+  })
+
+  if (nrow(all_signals) == 0) return(compute_metrics(numeric(0)))
+
+  weights <- construct_weights(all_signals)
+
+  # Daily return series for the tradeable universe
+  daily_returns <- features %>%
+    dplyr::filter(symbol != "SPY") %>%
+    dplyr::select(symbol, date, ClCl)
+
+  all_dates   <- sort(unique(daily_returns$date))
+  all_symbols <- unique(weights$symbol)
+
+  # Forward-fill rebalancing weights to daily frequency, then lag by 1 day
+  # to simulate next-day execution (avoids same-bar execution bias).
+  portfolio <- expand.grid(date = all_dates, symbol = all_symbols,
+                           stringsAsFactors = FALSE) %>%
+    dplyr::arrange(symbol, date) %>%
+    dplyr::left_join(weights %>% dplyr::select(symbol, date, weight),
+                     by = c("symbol", "date")) %>%
+    dplyr::group_by(symbol) %>%
+    dplyr::arrange(date) %>%
+    tidyr::fill(weight, .direction = "down") %>%
+    dplyr::mutate(weight = dplyr::lag(weight, 1)) %>%   # 1-day execution lag
+    dplyr::ungroup() %>%
+    dplyr::left_join(daily_returns, by = c("symbol", "date")) %>%
+    dplyr::filter(!is.na(weight), !is.na(ClCl))
+
+  # Daily strategy return = sum of weighted sector returns
+  strategy_returns <- portfolio %>%
+    dplyr::group_by(date) %>%
+    dplyr::summarise(ret = sum(weight * ClCl, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::arrange(date)
+
+  compute_metrics(strategy_returns$ret, rf_daily)
+}
+```
+
+```{r, "Grid Search"}
+# run_grid_search: exhaustive 2D grid search over window × dW for each K.
+#
+# Runs the full backtest pipeline for every (window, dW, k) combination.
+# Results can be visualised as heatmaps (one per metric) to assess
+# parameter sensitivity rather than cherry-picking optimal values.
+#
+# Parallelisation via parallel::parLapply is optional. When enabled, all
+# available cores minus one are used. Each worker receives a full copy of
+# the required functions and packages.
+#
+# Args:
+#   dat          : Returns df (train_df or test_df).
+#   window_grid  : Integer vector of window sizes to test.
+#   dW_grid      : Numeric vector of dW values to test.
+#   k_values     : Integer vector of K cluster counts to test.
+#   dV           : Fixed Kalman observation noise. Default 1.
+#   rf_daily     : Daily risk-free rate. Default 0.
+#   parallel     : Logical. Use multi-core parallel execution. Default FALSE.
+#
+# Returns:
+#   df with columns: window, dW, k, sharpe, cum_return, max_drawdown,
+#   annual_vol, omega. One row per (window, dW, k) combination.
+
+run_grid_search <- function(dat, window_grid, dW_grid, k_values,
+                            dV = 1, rf_daily = 0, parallel = FALSE) {
+
+  param_grid <- expand.grid(window = window_grid, dW = dW_grid, k = k_values,
+                            stringsAsFactors = FALSE)
+
+  message("Grid search: ", nrow(param_grid), " combinations across ",
+          length(window_grid), " windows × ",
+          length(dW_grid), " dW values × ",
+          length(k_values), " K values.")
+
+  run_one <- function(i) {
+    p <- param_grid[i, ]
+    result <- tryCatch(
+      run_backtest(dat, window = p$window, dW = p$dW, k = p$k,
+                   dV = dV, rf_daily = rf_daily),
+      error = function(e) {
+        list(sharpe = NA_real_, cum_return = NA_real_, max_drawdown = NA_real_,
+             annual_vol = NA_real_, omega = NA_real_, returns = NA)
+      }
+    )
+    data.frame(window = p$window, dW = p$dW, k = p$k,
+               sharpe       = result$sharpe,
+               cum_return   = result$cum_return,
+               max_drawdown = result$max_drawdown,
+               annual_vol   = result$annual_vol,
+               omega        = result$omega)
+  }
+
+  if (parallel) {
+    n_cores <- max(1L, parallel::detectCores() - 1L)
+    cl <- parallel::makeCluster(n_cores)
+    on.exit(parallel::stopCluster(cl), add = TRUE)
+
+    # Export all pipeline functions and packages to workers
+    fn_names <- c("run_backtest", "add_rollers", "kalman_smooth_all",
+                  "get_monthly_snapshots", "cluster_sectors", "evaluate_k",
+                  "generate_signals", "construct_weights", "compute_metrics")
+    parallel::clusterExport(cl, varlist = fn_names, envir = environment())
+    parallel::clusterEvalQ(cl, {
+      library(dplyr); library(dlm); library(slider)
+      library(tidyr); library(purrr); library(cluster); library(tibble)
+    })
+
+    results <- do.call(rbind, parallel::parLapply(cl, seq_len(nrow(param_grid)),
+                                                   run_one))
+  } else {
+    results <- purrr::map_dfr(seq_len(nrow(param_grid)), run_one)
+  }
+
+  results
+}
+```
+
+```{r, "Visualization"}
+# plot_sensitivity: renders heatmaps of performance metrics across the
+# window × dW grid. One plot per metric, faceted by K when multiple
+# K values are present.
+#
+# Args:
+#   grid_results : Output df from run_grid_search.
+#   k_filter     : Optional integer to show only a specific K. NULL = all K.
+#
+# Returns:
+#   Named list of ggplot objects: sharpe, cum_return, max_drawdown,
+#   annual_vol, omega.
+
+plot_sensitivity <- function(grid_results, k_filter = NULL) {
+
+  if (!is.null(k_filter)) {
+    grid_results <- grid_results %>% dplyr::filter(k == k_filter)
+  }
+
+  metrics <- c("sharpe", "cum_return", "max_drawdown", "annual_vol", "omega")
+  labels  <- c("Sharpe Ratio", "Cumulative Return", "Max Drawdown",
+                "Annual Volatility", "Omega Ratio")
+
+  purrr::map2(metrics, labels, function(metric, label) {
+    ggplot2::ggplot(
+      grid_results,
+      ggplot2::aes(x = factor(window), y = factor(dW),
+                   fill = .data[[metric]])
+    ) +
+      ggplot2::geom_tile(color = "white", linewidth = 0.3) +
+      ggplot2::geom_text(
+        ggplot2::aes(label = round(.data[[metric]], 2)),
+        size = 2.8, color = "white"
+      ) +
+      ggplot2::scale_fill_viridis_c(name = label, option = "plasma",
+                                    na.value = "grey50") +
+      ggplot2::facet_wrap(~ k, labeller = ggplot2::label_both) +
+      ggplot2::labs(title = label,
+                    x = "Window Size (days)",
+                    y = "dW (Kalman state noise)") +
+      ggplot2::theme_minimal(base_size = 11)
+  }) %>%
+    purrr::set_names(metrics)
+}
+
+
+# plot_backtest: performance tearsheet for a single backtest run.
+# Requires the $returns vector in the backtest result list.
+#
+# Args:
+#   backtest_result : Output from run_backtest (must include $returns).
+#   title           : Chart title string.
+#
+# Returns:
+#   A patchwork-combined ggplot of 4 panels: cumulative return, drawdown,
+#   rolling 60-day Sharpe, rolling 60-day annualised volatility.
+
+plot_backtest <- function(backtest_result,
+                          title = "Strategy Performance") {
+
+  returns <- backtest_result$returns
+  if (length(returns) == 0 || all(is.na(returns))) {
+    stop("backtest_result$returns is empty. Run run_backtest() first.")
+  }
+
+  n  <- length(returns)
+  cr <- cumprod(1 + returns)
+
+  df <- data.frame(
+    t        = seq_len(n),
+    ret      = returns,
+    cum_ret  = cr - 1,
+    drawdown = (cr - cummax(cr)) / cummax(cr),
+    roll_sharpe = slider::slide_dbl(
+      returns, ~ sqrt(252) * mean(.x) / sd(.x),
+      .before = 59, .complete = TRUE
+    ),
+    roll_vol = slider::slide_dbl(
+      returns, ~ sd(.x) * sqrt(252),
+      .before = 59, .complete = TRUE
+    )
+  )
+
+  p1 <- ggplot2::ggplot(df, ggplot2::aes(x = t, y = cum_ret)) +
+    ggplot2::geom_line(color = "#2196F3", linewidth = 0.7) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.4) +
+    ggplot2::labs(title = "Cumulative Return", x = NULL, y = NULL) +
+    ggplot2::theme_minimal()
+
+  p2 <- ggplot2::ggplot(df, ggplot2::aes(x = t, y = drawdown)) +
+    ggplot2::geom_area(fill = "#F44336", alpha = 0.55) +
+    ggplot2::labs(title = "Drawdown", x = NULL, y = NULL) +
+    ggplot2::theme_minimal()
+
+  p3 <- ggplot2::ggplot(df, ggplot2::aes(x = t, y = roll_sharpe)) +
+    ggplot2::geom_line(color = "#4CAF50", linewidth = 0.7) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.4) +
+    ggplot2::labs(title = "Rolling 60-Day Sharpe", x = NULL, y = NULL) +
+    ggplot2::theme_minimal()
+
+  p4 <- ggplot2::ggplot(df, ggplot2::aes(x = t, y = roll_vol)) +
+    ggplot2::geom_line(color = "#FF9800", linewidth = 0.7) +
+    ggplot2::labs(title = "Rolling 60-Day Vol (Ann.)",
+                  x = "Trading Day", y = NULL) +
+    ggplot2::theme_minimal()
+
+  (p1 / p2 / p3 / p4) +
+    patchwork::plot_annotation(title = title)
+}
+```
