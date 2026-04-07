@@ -1,13 +1,18 @@
 ---
-title: "Fin-452-QTP"
-author: "Alex Hirtle"
+title: "QTP"
+author: "Alex Hirtle - 1719121"
 editor: visual
 format:
   html:
-    embedd-resource: true
+    embed-resources: true
     self-contained: true
 ---
-```{r, "Libraries"}
+
+```{r, "Chunk Opts", echo = F, warning = F, message = F}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r, "Libraries", include = F}
 library(tidyverse)
 library(tidyquant)
 library(PerformanceAnalytics)
@@ -18,10 +23,11 @@ library(doParallel)
 library(dlm)
 library(purrr)
 library(patchwork)
+library(timetk)
+library(plotly)
 ```
 
-
-```{r, "Pulling Data"}
+```{r, "Pulling Data", include = F}
 tickers <- c("SPY", "XLB", "XLC", "XLE",
              "XLF", "XLI", "XLK", "XLP",
              "XLRE", "XLV", "XLU", "XLY")
@@ -35,15 +41,15 @@ train_data <- raw_data %>% dplyr::filter(date <= "2024-12-31")
 test_data  <- raw_data %>% dplyr::filter(date >= "2025-01-01")
 ```
 
-```{r, "Returns"}
+```{r, "Returns", include = F}
 # Adds OpCl, ClCl, ClOp log returns to the df per symbol.
 add_returns <- function(dat) {
   dat %>%
     dplyr::group_by(symbol) %>%
     dplyr::mutate(
-      OpCl = (close / open) - 1,
-      ClCl = (close / dplyr::lag(close)) - 1,
-      ClOp = (open  / dplyr::lag(close)) - 1
+      OpCl = (close    / open)                    - 1,  # intraday: same-day prices, no adj needed
+      ClCl = (adjusted / dplyr::lag(adjusted))    - 1,  # total daily return including dividends
+      ClOp = (open     / dplyr::lag(adjusted))    - 1   # overnight: prev adj close to today's open
     ) %>%
     stats::na.omit() %>%
     dplyr::ungroup()
@@ -55,7 +61,7 @@ test_df  <- add_returns(test_data)
 write.csv(test_df, "Testing_DF_Returns")
 ```
 
-```{r, "Rolling Stats"}
+```{r, "Rolling Stats", include = F}
 # Adds rolling mean (short + long for MA crossover), vol, vol-of-vol,
 # volume mean, Sharpe, Sortino, momentum, SPY correlation, and max drawdown.
 #
@@ -243,7 +249,7 @@ add_rollers <- function(
 }
 ```
 
-```{r, "Kalman Smoothing"}
+```{r, "Kalman Smoothing", include = F}
 # Applies a local-level Kalman filter to every rolling stat column.
 # Each series is normalised to zero mean / unit variance before filtering
 # so that the same dV and dW are meaningful across all columns regardless
@@ -312,7 +318,7 @@ kalman_smooth_all <- function(dat, dW, dV = 1) {
 }
 ```
 
-```{r, "Monthly Snapshots"}
+```{r, "Monthly Snapshots", include = F}
 # Extracts the last trading day of each calendar month per symbol.
 # These are the rebalancing observation points — all clustering and signal
 # logic operates on this reduced dataframe.
@@ -333,7 +339,7 @@ get_monthly_snapshots <- function(dat) {
 }
 ```
 
-```{r, "Clustering"}
+```{r, "Clustering", include = F}
 # evaluate_k: compares cluster quality across multiple K values using
 # within-cluster sum of squares (elbow method) and average silhouette width.
 # Run this once on the full snapshot history to inform K selection before
@@ -477,7 +483,7 @@ cluster_sectors <- function(snapshot_dat, k, rebalance_date,
 }
 ```
 
-```{r, "Signals"}
+```{r, "Signals", include = F}
 # generate_signals: computes a continuous composite signal per sector per
 # rebalancing date.
 #
@@ -585,7 +591,7 @@ construct_weights <- function(signals_dat) {
 }
 ```
 
-```{r, "Backtest"}
+```{r, "Backtest", include = F}
 # compute_metrics: computes all performance metrics from a daily return vector.
 #
 # Args:
@@ -636,17 +642,20 @@ compute_metrics <- function(returns, rf_daily = 0) {
 # execution bias (signals observed at close, executed next day).
 #
 # Args:
-#   dat      : Returns df (train_df or test_df).
-#   window   : Global window size passed to add_rollers.
-#   dW       : Kalman state noise passed to kalman_smooth_all.
-#   k        : Number of clusters for cluster_sectors.
-#   dV       : Kalman observation noise. Fixed at 1.
-#   rf_daily : Daily risk-free rate.
+#   dat         : Returns df (train_df or test_df).
+#   window      : Global window size passed to add_rollers.
+#   dW          : Kalman state noise passed to kalman_smooth_all.
+#   k           : Number of clusters for cluster_sectors.
+#   dV          : Kalman observation noise. Fixed at 1.
+#   rf_daily    : Daily risk-free rate.
+#   return_full : If TRUE, also returns strategy_returns_df, weights_df,
+#                 and portfolio_df for inspection and charting.
 #
 # Returns:
-#   Output of compute_metrics (named list including the returns vector).
+#   Output of compute_metrics plus optionally the full intermediate dfs.
 
-run_backtest <- function(dat, window, dW, k, dV = 1, rf_daily = 0) {
+run_backtest <- function(dat, window, dW, k, dV = 1, rf_daily = 0,
+                         return_full = FALSE) {
 
   # Feature engineering — SPY stays in at this stage for corr computation
   features <- dat %>%
@@ -728,11 +737,21 @@ run_backtest <- function(dat, window, dW, k, dV = 1, rf_daily = 0) {
     dplyr::summarise(ret = sum(weight * ClCl, na.rm = TRUE), .groups = "drop") %>%
     dplyr::arrange(date)
 
-  compute_metrics(strategy_returns$ret, rf_daily)
+  metrics <- compute_metrics(strategy_returns$ret, rf_daily)
+
+  if (return_full) {
+    c(metrics, list(
+      strategy_returns_df = strategy_returns,
+      weights_df          = weights,
+      portfolio_df        = portfolio
+    ))
+  } else {
+    metrics
+  }
 }
 ```
 
-```{r, "Grid Search"}
+```{r, "Grid Search", include = F}
 # run_grid_search: exhaustive 2D grid search over window × dW for each K.
 #
 # Runs the full backtest pipeline for every (window, dW, k) combination.
@@ -790,18 +809,73 @@ run_grid_search <- function(dat, window_grid, dW_grid, k_values,
     cl <- parallel::makeCluster(n_cores)
     on.exit(parallel::stopCluster(cl), add = TRUE)
 
-    # Export all pipeline functions and packages to workers
     fn_names <- c("run_backtest", "add_rollers", "kalman_smooth_all",
-                  "get_monthly_snapshots", "cluster_sectors", "evaluate_k",
+                  "get_monthly_snapshots", "cluster_sectors",
                   "generate_signals", "construct_weights", "compute_metrics")
-    parallel::clusterExport(cl, varlist = fn_names, envir = environment())
+
+    # Root cause of prior all-NA failures: run_one's enclosing env contained
+    # `cl` (a socket connection — not serializable) and the entire knitr global
+    # env (hundreds of MB). parLapply silently corrupted every worker call.
+    #
+    # Fix — two parts:
+    #   1. Give each pipeline function a clean minimal enclosing env so
+    #      serializing them doesn't drag in the global env.
+    #   2. Give worker_fn environment = baseenv() so parLapply serializes
+    #      only its bytecode. All needed objects are retrieved explicitly
+    #      from the worker's .GlobalEnv via base::get().
+
+    # Part 1: clean pipeline function closures
+    clean_env <- new.env(parent = baseenv())
+    for (nm in fn_names) {
+      fn_obj <- get(nm, envir = globalenv(), inherits = TRUE)
+      environment(fn_obj) <- clean_env
+      assign(nm, fn_obj, envir = clean_env)
+    }
+
+    # Ship clean functions + data to each worker's .GlobalEnv
+    parallel::clusterCall(cl, function(fns) {
+      for (nm in names(fns)) assign(nm, fns[[nm]], envir = .GlobalEnv)
+      invisible(NULL)
+    }, fns = as.list(clean_env))
+
+    # dat, param_grid, dV, rf_daily live in the local exec env — clusterExport
+    # finds them there correctly (they are not in the global env chain).
+    parallel::clusterExport(cl, c("dat", "param_grid", "dV", "rf_daily"),
+                            envir = environment())
+
     parallel::clusterEvalQ(cl, {
       library(dplyr); library(dlm); library(slider)
       library(tidyr); library(purrr); library(cluster); library(tibble)
     })
 
+    # Part 2: worker_fn with baseenv() enclosure — serializes as bytecode only
+    worker_fn <- function(i) {
+      rb <- base::get("run_backtest", envir = .GlobalEnv, inherits = FALSE)
+      d  <- base::get("dat",          envir = .GlobalEnv, inherits = FALSE)
+      pg <- base::get("param_grid",   envir = .GlobalEnv, inherits = FALSE)
+      dv <- base::get("dV",           envir = .GlobalEnv, inherits = FALSE)
+      rf <- base::get("rf_daily",     envir = .GlobalEnv, inherits = FALSE)
+      p  <- pg[i, ]
+      result <- tryCatch(
+        rb(d, window = p$window, dW = p$dW, k = p$k, dV = dv, rf_daily = rf),
+        error = function(e) {
+          list(sharpe = NA_real_, cum_return = NA_real_, max_drawdown = NA_real_,
+               annual_vol = NA_real_, omega = NA_real_, returns = NA)
+        }
+      )
+      data.frame(window       = p$window,
+                 dW           = p$dW,
+                 k            = p$k,
+                 sharpe       = result$sharpe,
+                 cum_return   = result$cum_return,
+                 max_drawdown = result$max_drawdown,
+                 annual_vol   = result$annual_vol,
+                 omega        = result$omega)
+    }
+    environment(worker_fn) <- baseenv()
+
     results <- do.call(rbind, parallel::parLapply(cl, seq_len(nrow(param_grid)),
-                                                   run_one))
+                                                   worker_fn))
   } else {
     results <- purrr::map_dfr(seq_len(nrow(param_grid)), run_one)
   }
@@ -810,7 +884,7 @@ run_grid_search <- function(dat, window_grid, dW_grid, k_values,
 }
 ```
 
-```{r, "Visualization"}
+```{r, "Visualization", include = F}
 # plot_sensitivity: renders heatmaps of performance metrics across the
 # window × dW grid. One plot per metric, faceted by K when multiple
 # K values are present.
@@ -919,4 +993,574 @@ plot_backtest <- function(backtest_result,
   (p1 / p2 / p3 / p4) +
     patchwork::plot_annotation(title = title)
 }
+```
+
+# Introduction
+
+This document outlines the design, implementation, and evaluation of a momentum-based sector rotation strategy applied to the eleven SPDR S&P 500 sector ETFs alongside SPY as a benchmark. The strategy uses rolling feature engineering, Kalman filter smoothing, hierarchical clustering, and a composite MA-crossover signal to construct a monthly-rebalanced, dollar-neutral long-short portfolio.
+
+The pipeline consists of four main stages: (1) computation of rolling statistics for each sector, (2) Kalman smoothing of those features to reduce noise, (3) hierarchical clustering of sectors at each monthly rebalance date, and (4) construction of a composite signal that drives weight allocation. A one-day execution lag is applied throughout to avoid same-bar execution bias.
+
+The training period covers mid-2000 through December 2024. Testing runs from January 2025 through February 2026. Baseline parameters — a 126-day window, dW = 0.01, and K = 3 — were selected heuristically and later evaluated against a broader parameter grid.
+
+# Rationale
+
+The academic support for momentum as a persistent return predictor is substantial. Jegadeesh and Titman (1993) were among the first to rigorously document return continuation across U.S. equities, finding that portfolios of prior winners consistently outperformed prior losers over 3–12 month horizons. This anomaly has proven durable: Asness, Moskowitz, and Pedersen (2013) documented its persistence across multiple asset classes and geographies over long out-of-sample periods.
+
+More directly relevant to this strategy, Moskowitz and Grinblatt (1999) showed that industry-level momentum accounts for a significant portion of the individual stock momentum effect. Operating at the sector ETF level — rather than on individual securities — attempts to capture exactly this industry component while benefiting from the liquidity and diversification that broad sector baskets provide.
+
+A known risk in any momentum approach is the momentum crash phenomenon described by Daniel and Moskowitz (2016), where momentum strategies experience sharp reversals, typically after periods of high market stress and subsequent recovery. The strategy described here has no explicit crash protection, which is a meaningful unaddressed risk.
+
+## Correlation
+
+To justify a cross-sector relative-value strategy, the return correlation structure across sectors must be examined. High correlation confirms common market-wide exposure that a dollar-neutral position will partially hedge, while meaningful pairwise variation across sectors provides the information content needed for relative bets.
+
+```{r, "Correlation Compute", include = F}
+cor_mat <- train_df %>%
+  dplyr::select(symbol, date, ClCl) %>%
+  tidyr::pivot_wider(names_from = symbol, values_from = ClCl) %>%
+  dplyr::select(-date) %>%
+  cor(use = "complete.obs")
+
+cor_long <- as.data.frame(as.table(cor_mat)) %>%
+  dplyr::rename(Asset1 = Var1, Asset2 = Var2, Correlation = Freq)
+
+p_corr <- ggplot2::ggplot(cor_long, ggplot2::aes(x = Asset1, y = Asset2, fill = Correlation)) +
+  ggplot2::geom_tile(color = "white") +
+  ggplot2::geom_text(ggplot2::aes(label = round(Correlation, 2)), size = 2.8) +
+  ggplot2::scale_fill_gradient2(low = "red", mid = "white", high = "blue",
+                                 midpoint = 0, limits = c(-1, 1)) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) +
+  ggplot2::labs(title = "Sector ETF Return Correlation", x = NULL, y = NULL)
+```
+
+```{r, "Correlation - Out", echo = F, warning = F, message = F}
+p_corr
+```
+
+The correlation matrix confirms substantial co-movement across all sector ETFs, as expected given shared exposure to the broad equity market. Correlations are uniformly positive — most pairs sit in the 0.6–0.9 range. Defensive sectors (XLU, XLRE, XLP) tend to correlate slightly less with cyclicals (XLK, XLY, XLE), which reflects their different factor sensitivities and provides some basis for relative positioning. A dollar-neutral portfolio will hedge out a large fraction of market-wide risk, but correlated drawdowns during severe market stress will still affect both long and short legs.
+
+# Strategy
+
+## Overview
+
+The strategy pipeline has four stages:
+
+**1. Feature Engineering** — Rolling statistics are computed daily per sector: short and long moving averages (for the MA crossover signal), rolling volatility (standard deviation of ClCl returns), Sharpe ratio, Sortino ratio, momentum (cumulative compound return), correlation to SPY, and maximum drawdown. The baseline uses a 126-day global window with a short window of 32 days (≈ window/4).
+
+**2. Kalman Smoothing** — Each rolling feature series is passed through a local-level Kalman filter (random-walk state, Gaussian observation noise). Series are normalised to zero mean and unit variance before filtering so that the single state-noise parameter *dW* is comparable across all features. Lower *dW* produces heavier smoothing and slower adaptation to regime changes; higher *dW* tracks the raw data more closely.
+
+**3. Hierarchical Clustering** — At each monthly rebalancing date, the eleven sector ETFs are grouped into K clusters using hierarchical clustering (Ward's linkage, Euclidean distance) applied to the smoothed feature vectors. An expanding-window normalisation is used at each rebalance date to avoid look-ahead bias. The intent is to identify peer groups — sectors behaving similarly — whose consensus can confirm or penalise individual signals.
+
+**4. Signal Construction and Weight Allocation** — A composite signal is computed per sector as the product of: (a) the continuous MA crossover magnitude `(short_MA − long_MA) / |long_MA|`, (b) a cluster confirmation score (fraction of cluster peers sharing the same directional signal), and (c) inverse volatility. Sectors with a positive composite are held long; negative composites are held short. Weights are proportional to composite magnitude within each side. The portfolio is dollar-neutral at every rebalance. A one-day execution lag is applied — signals observed at month-end close are acted on the following trading day.
+
+## Clustering
+
+To select K, the dendrogram and elbow/silhouette diagnostics are examined over K = 2 through 6. Sectors are characterised by their mean feature values across all training snapshots and clustered once to produce stable groupings for visual inspection.
+
+```{r, "K Evaluation Compute", include = F}
+baseline_window <- 126
+
+baseline_features <- train_df %>%
+  add_rollers(window = baseline_window) %>%
+  kalman_smooth_all(dW = 0.01)
+
+train_snapshots <- baseline_features %>%
+  dplyr::filter(symbol != "SPY") %>%
+  get_monthly_snapshots()
+
+k_eval <- evaluate_k(train_snapshots, k_values = 2:6)
+```
+
+```{r, "K Evaluation - Out", echo = F, warning = F, message = F}
+k_eval$p_elbow + k_eval$p_sil
+```
+
+```{r, "Dendrogram - Out", echo = F, warning = F, message = F}
+plot(k_eval$dendrogram, main = "Sector Dendrogram", sub = "", xlab = "")
+```
+
+The diagnostics suggest K = 3 as a reasonable baseline — the silhouette peaks there and the elbow in the WCSS curve is most visible at that point, though the differences across K = 2 to 4 are modest given the small universe of eleven sectors. The dendrogram broadly separates defensive/income sectors (XLU, XLRE, XLP), growth/technology sectors (XLK, XLC, XLY), and cyclical/value sectors (XLE, XLB, XLI, XLF, XLV). This grouping is broadly consistent with how practitioners classify sectors, which provides a basic sanity check that the clustering is picking up real structure rather than noise.
+
+It is worth noting that with only eleven sectors, any clustering algorithm will produce coarse groupings. The marginal value of the clustering step over a manually-defined sector-group categorisation has not been rigorously tested here.
+
+# Performance
+
+The strategy was evaluated on two periods: a long in-sample training period (June 2000 – December 2024) and a short out-of-sample testing period (January 2025 – February 2026). Baseline parameters of window = 126, dW = 0.01, and K = 3 were used for both runs. These parameters were selected after observing training-period behaviour, so in-sample metrics should be interpreted cautiously.
+
+## Training
+
+The training run covers approximately 24 years of sector ETF history. This period includes the dot-com bust, the 2008 financial crisis, the 2020 COVID selloff, and the subsequent recovery — a wide range of market conditions. A long history provides statistical stability, but it also means the strategy will have experienced multiple momentum regime shifts, including the crashes documented by Daniel and Moskowitz (2016).
+
+```{r, "Training Backtest Compute", include = F}
+baseline_train <- run_backtest(train_df, window = 126, dW = 0.01, k = 3,
+                               return_full = TRUE)
+```
+
+```{r, "XTS Prep - Training", include = F}
+# Core daily equity series
+tick_train <- baseline_train$strategy_returns_df %>%
+  dplyr::mutate(
+    cumeq       = cumprod(1 + ret),
+    drawdown    = (cumeq - cummax(cumeq)) / cummax(cumeq),
+    roll_sharpe = slider::slide_dbl(ret, ~ sqrt(252) * mean(.x) / sd(.x),
+                                    .before = 59, .complete = TRUE)
+  ) %>%
+  timetk::tk_xts(date_var = date)
+
+# SPY benchmark cumulative return over same period
+spy_bench_train <- train_df %>%
+  dplyr::filter(
+    symbol == "SPY",
+    date   >= min(baseline_train$strategy_returns_df$date),
+    date   <= max(baseline_train$strategy_returns_df$date)
+  ) %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(spy_cumeq = cumprod(1 + ClCl)) %>%
+  dplyr::select(date, spy_cumeq) %>%
+  timetk::tk_xts(date_var = date)
+
+# Top and bottom weight per rebalance date, forward-filled to daily
+top_bot_train <- baseline_train$weights_df %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(top_weight = max(weight, na.rm = TRUE),
+                   bot_weight = min(weight, na.rm = TRUE),
+                   .groups = "drop")
+
+tick_exposure_train <- baseline_train$strategy_returns_df %>%
+  dplyr::select(date) %>%
+  dplyr::left_join(top_bot_train, by = "date") %>%
+  dplyr::arrange(date) %>%
+  tidyr::fill(top_weight, bot_weight, .direction = "down") %>%
+  timetk::tk_xts(date_var = date)
+
+# Per-sector weights at each monthly rebalance as XTS (for multi-line plot)
+tick_sector_weights_train <- baseline_train$weights_df %>%
+  dplyr::select(symbol, date, weight) %>%
+  tidyr::pivot_wider(names_from = symbol, values_from = weight) %>%
+  timetk::tk_xts(date_var = date)
+
+# Sector weight heatmap (rebalance dates only)
+p_sector_heatmap_train <- baseline_train$weights_df %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = symbol, fill = weight)) +
+  ggplot2::geom_tile(color = "white") +
+  ggplot2::scale_fill_gradient2(low = "#F44336", mid = "white", high = "#2196F3",
+                                 midpoint = 0) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) +
+  ggplot2::labs(title = "Sector Weights at Each Rebalance — Training",
+                x = NULL, y = NULL)
+```
+
+```{r, "Training - Tearsheet", echo = F, warning = F, message = F}
+plot_backtest(baseline_train, title = "Training Period — Strategy Performance")
+```
+
+```{r, "Training Chart A - CumEQ", echo = F, warning = F, message = F}
+plot(tick_train$cumeq, main = "Training — Cumulative Equity")
+```
+
+```{r, "Training Chart A - Daily Returns", echo = F, warning = F, message = F}
+xts::addSeries(tick_train$ret,
+               main = "Daily Returns", on = NA,
+               type = "h", col = "blue", lty = 1, lwd = 1, pch = 0)
+```
+
+```{r, "Training Chart A - Top Weight", echo = F, warning = F, message = F}
+xts::addSeries(tick_exposure_train$top_weight,
+               main = "Top Weight", on = NA,
+               type = "l", col = "darkgreen", lty = 1, lwd = 1, pch = 0)
+```
+
+```{r, "Training Chart A - Bot Weight", echo = F, warning = F, message = F}
+xts::addSeries(tick_exposure_train$bot_weight,
+               main = "Bot Weight", on = NA,
+               type = "l", col = "red", lty = 1, lwd = 1, pch = 0)
+```
+
+```{r, "Training Chart B - Strategy vs SPY", echo = F, warning = F, message = F}
+plot(tick_train$cumeq, main = "Training — Strategy vs SPY")
+```
+
+```{r, "Training Chart B - SPY CumEq", echo = F, warning = F, message = F}
+xts::addSeries(spy_bench_train$spy_cumeq,
+               main = "SPY CumEq", on = NA,
+               type = "l", col = "orange", lty = 1, lwd = 1, pch = 0)
+```
+
+```{r, "Training Chart B - Drawdown", echo = F, warning = F, message = F}
+xts::addSeries(tick_train$drawdown,
+               main = "Drawdown", on = NA,
+               type = "l", col = "red", lty = 1, lwd = 1, pch = 0)
+```
+
+```{r, "Training Chart C - CumEQ Equity", echo = F, warning = F, message = F}
+plot(tick_train$cumeq, main = "Training — Equity & Rolling Sharpe")
+```
+
+```{r, "Training Chart C - Rolling Sharpe", echo = F, warning = F, message = F}
+xts::addSeries(tick_train$roll_sharpe,
+               main = "Rolling 60d Sharpe", on = NA,
+               type = "l", col = "purple", lty = 1, lwd = 1, pch = 0)
+```
+
+```{r, "Training Chart C - Daily Returns", echo = F, warning = F, message = F}
+xts::addSeries(tick_train$ret,
+               main = "Daily Returns", on = NA,
+               type = "h", col = "blue", lty = 1, lwd = 1, pch = 0)
+```
+
+```{r, "Training Chart D - Sector Weights XTS", echo = F, warning = F, message = F}
+plot(tick_sector_weights_train, main = "Training — Sector Weights at Rebalance")
+```
+
+```{r, "Training Chart E - Sector Weight Heatmap", echo = F, warning = F, message = F}
+p_sector_heatmap_train
+```
+
+The training period results are negative — the strategy lost money over the 2000–2024 period. The cumulative equity curve ends below its starting value, and the Sharpe ratio is below zero. This is a poor result, and it is the in-sample result, meaning there was no out-of-sample degradation needed to produce it; the strategy simply did not work on the data it was designed on.
+
+The equity curve does show periods of gains, but these were offset by drawdowns that were not recovered. The strategy appears to respond to some momentum regimes but reverses sharply in others, with no net positive edge over the full period.
+
+The SPY comparison makes the result starker. A long-only SPY position over the same period, despite living through two major crashes, significantly outperformed the strategy. The dollar-neutral design is intended to hedge market exposure, but it did not convert that hedge into a positive return — it simply removed market beta while the relative sector bets also failed to add value on net.
+
+## Testing
+
+The testing period covers January 2025 through February 2026 — approximately 14 months. This is a fairly short window, and any conclusions drawn from it should be held loosely. One poor or good run in a short period can look dramatic on a cumulative return chart without being statistically meaningful.
+
+```{r, "Testing Backtest Compute", include = F}
+baseline_test <- run_backtest(test_df, window = 126, dW = 0.01, k = 3,
+                              return_full = TRUE)
+```
+
+```{r, "XTS Prep - Testing", include = F}
+tick_test <- baseline_test$strategy_returns_df %>%
+  dplyr::mutate(
+    cumeq       = cumprod(1 + ret),
+    drawdown    = (cumeq - cummax(cumeq)) / cummax(cumeq),
+    roll_sharpe = slider::slide_dbl(ret, ~ sqrt(252) * mean(.x) / sd(.x),
+                                    .before = 59, .complete = TRUE)
+  ) %>%
+  timetk::tk_xts(date_var = date)
+
+spy_bench_test <- test_df %>%
+  dplyr::filter(
+    symbol == "SPY",
+    date   >= min(baseline_test$strategy_returns_df$date),
+    date   <= max(baseline_test$strategy_returns_df$date)
+  ) %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(spy_cumeq = cumprod(1 + ClCl)) %>%
+  dplyr::select(date, spy_cumeq) %>%
+  timetk::tk_xts(date_var = date)
+
+top_bot_test <- baseline_test$weights_df %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(top_weight = max(weight, na.rm = TRUE),
+                   bot_weight = min(weight, na.rm = TRUE),
+                   .groups = "drop")
+
+tick_exposure_test <- baseline_test$strategy_returns_df %>%
+  dplyr::select(date) %>%
+  dplyr::left_join(top_bot_test, by = "date") %>%
+  dplyr::arrange(date) %>%
+  tidyr::fill(top_weight, bot_weight, .direction = "down") %>%
+  timetk::tk_xts(date_var = date)
+
+tick_sector_weights_test <- baseline_test$weights_df %>%
+  dplyr::select(symbol, date, weight) %>%
+  tidyr::pivot_wider(names_from = symbol, values_from = weight) %>%
+  timetk::tk_xts(date_var = date)
+
+p_sector_heatmap_test <- baseline_test$weights_df %>%
+  ggplot2::ggplot(ggplot2::aes(x = date, y = symbol, fill = weight)) +
+  ggplot2::geom_tile(color = "white") +
+  ggplot2::scale_fill_gradient2(low = "#F44336", mid = "white", high = "#2196F3",
+                                 midpoint = 0) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)) +
+  ggplot2::labs(title = "Sector Weights at Each Rebalance — Testing",
+                x = NULL, y = NULL)
+```
+
+```{r, "Testing - Tearsheet", echo = F, warning = F, message = F}
+plot_backtest(baseline_test, title = "Testing Period — Strategy Performance")
+```
+
+```{r, "Testing Chart A - CumEQ", echo = F, warning = F, message = F}
+plot(tick_test$cumeq, main = "Testing — Cumulative Equity")
+```
+
+```{r, "Testing Chart A - Daily Returns", echo = F, warning = F, message = F}
+xts::addSeries(tick_test$ret,
+               main = "Daily Returns", on = NA,
+               type = "h", col = "blue", lty = 1, lwd = 1, pch = 0)
+```
+
+```{r, "Testing Chart A - Top Weight", echo = F, warning = F, message = F}
+xts::addSeries(tick_exposure_test$top_weight,
+               main = "Top Weight", on = NA,
+               type = "l", col = "darkgreen", lty = 1, lwd = 1, pch = 0)
+```
+
+```{r, "Testing Chart A - Bot Weight", echo = F, warning = F, message = F}
+xts::addSeries(tick_exposure_test$bot_weight,
+               main = "Bot Weight", on = NA,
+               type = "l", col = "red", lty = 1, lwd = 1, pch = 0)
+```
+
+```{r, "Testing Chart B - Strategy vs SPY", echo = F, warning = F, message = F}
+plot(tick_test$cumeq, main = "Testing — Strategy vs SPY")
+```
+
+```{r, "Testing Chart B - SPY CumEq", echo = F, warning = F, message = F}
+xts::addSeries(spy_bench_test$spy_cumeq,
+               main = "SPY CumEq", on = NA,
+               type = "l", col = "orange", lty = 1, lwd = 1, pch = 0)
+```
+
+```{r, "Testing Chart B - Drawdown", echo = F, warning = F, message = F}
+xts::addSeries(tick_test$drawdown,
+               main = "Drawdown", on = NA,
+               type = "l", col = "red", lty = 1, lwd = 1, pch = 0)
+```
+
+```{r, "Testing Chart C - Sector Weights XTS", echo = F, warning = F, message = F}
+plot(tick_sector_weights_test, main = "Testing — Sector Weights at Rebalance")
+```
+
+```{r, "Testing Chart D - Sector Weight Heatmap", echo = F, warning = F, message = F}
+p_sector_heatmap_test
+```
+
+The testing period performance is also negative, which is consistent with but no worse than the training result. Since the strategy lost money in-sample, continued losses out-of-sample are not a surprise — the signal simply does not appear to have a positive edge in the configuration tested.
+
+The sector weight heatmap shows the model continued to rotate positions, which confirms the mechanics are running correctly. The issue is not a broken pipeline — weights are being assigned and sectors are being traded — it's that the direction of those trades was not profitable on net.
+
+The 14-month testing window is too short to draw statistical conclusions in isolation. But combined with the negative training result, there is no evidence from either period that the current signal construction generates a reliable edge.
+
+# Optimization
+
+To assess parameter sensitivity and move beyond heuristically-chosen baseline values, a grid search was run over the following ranges:
+
+- **Window:** 40, 60, 80, 100, 126, 160 days
+- **dW (Kalman state noise):** 0.001, 0.01, 0.1, 1.0
+- **K (cluster count):** 2, 3, 4
+
+This produced 72 total combinations, evaluated on the training period only. The goal is sensitivity analysis rather than optimization — identifying whether there is a robust region of the parameter space that performs consistently, or whether results are highly dependent on the specific values chosen.
+
+```{r, "Grid Search Compute", include = F}
+grid_results <- run_grid_search(
+  dat         = train_df,
+  window_grid = c(40, 60, 80, 100, 126, 160),
+  dW_grid     = c(0.001, 0.01, 0.1, 1.0),
+  k_values    = c(2, 3, 4),
+  parallel    = TRUE
+)
+
+sensitivity_plots <- plot_sensitivity(grid_results)
+```
+
+```{r, "3D Surface Compute", include = F}
+# Build log-cumulative-return surface for k = 3 (window × dW grid)
+opt_window_vals <- sort(unique(grid_results$window))
+opt_dW_vals     <- sort(unique(grid_results$dW))
+
+cum_ret_matrix <- grid_results %>%
+  dplyr::filter(k == 3) %>%
+  dplyr::mutate(
+    # NAs become holes in the surface rather than collapsing the matrix shape
+    log_cum_return = dplyr::if_else(
+      is.finite(cum_return),
+      log(pmax(cum_return + 1, 1e-6)),
+      NA_real_
+    )
+  ) %>%
+  dplyr::select(window, dW, log_cum_return) %>%
+  tidyr::pivot_wider(values_from = log_cum_return, names_from = dW) %>%
+  dplyr::arrange(window) %>%
+  dplyr::select(-window) %>%
+  as.matrix()
+
+opt_3d_plot <- plotly::plot_ly(
+  x = ~opt_window_vals,
+  y = ~opt_dW_vals,
+  z = ~cum_ret_matrix
+) %>%
+  plotly::add_surface() %>%
+  plotly::layout(
+    scene = list(
+      xaxis = list(title = "Window"),
+      yaxis = list(title = "dW"),
+      zaxis = list(title = "Log Cum. Return")
+    ),
+    title = "Optimization Surface — Log Cumulative Return (k = 3)"
+  )
+```
+
+```{r, "3D Surface - Out", echo = F, warning = F, message = F}
+if (any(is.finite(cum_ret_matrix))) {
+  opt_3d_plot
+} else {
+  warning("3D surface skipped — all grid_results metrics are NA. Check worker errors in the data viewer.")
+}
+```
+
+```{r, "Optimization Heatmaps - Out", echo = F, warning = F, message = F}
+sensitivity_plots$sharpe
+sensitivity_plots$cum_return
+sensitivity_plots$max_drawdown
+sensitivity_plots$annual_vol
+sensitivity_plots$omega
+```
+
+The optimization results show that losses are broadly consistent across parameter combinations. There is no identifiable region of the grid that produces reliably positive returns, which reinforces the conclusion that the problem is structural rather than one of parameter misconfiguration.
+
+- **Window size:** Shorter windows (40–60 days) produce more volatile outcomes. Longer windows (100–160) are more stable but still negative. The baseline of 126 is not obviously worse or better than alternatives.
+- **dW:** Very low dW values (0.001 — heavy Kalman smoothing) appear to hurt performance, likely because smoothed features react too slowly to regime changes. Moderate values perform comparably to each other without a clear winner.
+- **K:** Differences across K = 2, 3, and 4 are small and inconsistent. The cluster confirmation component does not appear to add meaningful signal regardless of K, at least within this universe size.
+
+The 3D surface for K = 3 is irregular with no coherent optimum. This is not an encouraging result from an optimization standpoint — it suggests the returns are noise-driven rather than reflecting a stable underlying signal that happens to be misconfigured. If the strategy had a genuine edge, we would expect some coherent region of the surface to perform consistently.
+
+# Lessons Learned
+
+## Data and Feature Engineering
+
+Pulling historical sector ETF data via `tidyquant` was operationally straightforward, but the rolling statistics function grew in complexity as features were added. Keeping track of dynamic column naming (e.g., `mean_32d`, `vol_126d`) across a generic window parameter required careful convention management, and mismatches between expected and actual column names caused silent bugs early in development.
+
+An error made in an early version of the returns code was using raw `close` prices for overnight return calculations rather than `adjusted` values. For a same-day `OpCl` return this is correct, but for `ClCl` (total daily return) and `ClOp` (overnight), `adjusted` close must be used to account for splits and dividends. This caused performance figures to look subtly wrong until caught. The fix was simple, but it cost diagnostic time.
+
+## Strategy Complexity
+
+The composite signal design went through several iterations. Starting with a plain MA crossover and layering in cluster confirmation and inverse volatility weighting added plausibility but also added debugging difficulty. Each additional term can interact with the others in non-obvious ways, especially after Kalman smoothing.
+
+The Kalman smoothing step is the most complex piece of the pipeline and arguably the least validated. The local-level model assumption (random-walk state) is convenient but not strongly motivated. An EMA-based alternative would have been simpler, more interpretable, and worth testing as a baseline before introducing the Kalman filter. The decision to jump to Kalman smoothing was driven partly by theoretical appeal rather than a demonstrated need.
+
+## Clustering Utility
+
+Hierarchical clustering was chosen over K-means for its determinism (no random initialisation). This was the right call for reproducibility. However, the clustering's practical value is limited by the small universe size. With eleven sectors, K = 3 produces clusters of roughly three to four sectors each, and the cluster confirmation score does not vary much. In a larger universe (e.g., individual stocks), clustering would carry more information content.
+
+## Out-of-Sample Evaluation
+
+The most significant methodological limitation is the train/test split approach. The baseline parameters (window = 126, dW = 0.01, K = 3) were selected after observing training performance, introducing implicit data leakage. A walk-forward backtest — where parameters are re-estimated on a rolling basis and signals are generated one period at a time using only past data — would produce a much more credible out-of-sample performance estimate.
+
+The testing period is also too short (14 months) for statistically meaningful conclusions. Extending the dataset and running a rolling-window evaluation would be the correct next step before drawing any real conclusions about edge persistence.
+
+## Parallel Computation
+
+The grid search parallelisation required more debugging than anticipated. Workers receiving serialised R function closures that retained large enclosing environments caused silent all-NA failures. The fix — creating clean function environments and explicitly exporting only the required objects — worked but added non-trivial complexity. For a 72-combination grid, the sequential implementation would have been simpler and only marginally slower. The engineering overhead of correct parallelisation is worth paying at larger grid sizes, but for smaller searches, simplicity wins.
+
+# Conclusion
+
+This project implemented a momentum-based sector rotation strategy using the SPDR sector ETFs as the trading universe. The core approach — combining an MA crossover signal, Kalman-smoothed rolling features, hierarchical sector clustering, and inverse-volatility weighting — is grounded in a reasonable reading of the momentum literature (Jegadeesh & Titman, 1993; Moskowitz & Grinblatt, 1999; Asness, Moskowitz & Pedersen, 2013), and the pipeline is well-structured and fully reproducible.
+
+Training period performance is negative — the strategy lost money on the data it was designed on. Testing period performance was similarly poor. The grid search over 72 parameter combinations failed to identify a configuration that generates consistent positive in-sample returns, which means the problem is structural rather than one of misconfiguration.
+
+The academic literature provides solid support for sector-level momentum as a concept (Moskowitz & Grinblatt, 1999; Asness, Moskowitz & Pedersen, 2013), but implementing that concept as a working strategy clearly requires more than an MA crossover and hierarchical clustering. The composite signal may be too noisy, the monthly rebalancing frequency may be too slow, the cluster confirmation term may be adding noise rather than signal, or the Kalman smoothing may be damping meaningful variation. Diagnosing which would require systematic ablation testing — running versions of the pipeline with each component removed — which was not done here.
+
+The pipeline itself is structurally sound: the backtest avoids obvious look-ahead bias, the dollar-neutral construction is implemented correctly, and the evaluation is thorough. The engineering is fine. The trading signal is not. That distinction matters for what comes next — the code does not need to be rewritten, but the signal logic does.
+
+# Data Viewer
+
+```{r, "Data Viewer", eval = F, include = F}
+# =============================================================================
+# DATA VIEWER — not rendered. Run interactively to inspect each pipeline step.
+# =============================================================================
+
+# ---- Step 1: Raw Price Data -------------------------------------------------
+head(raw_data, 20)
+dplyr::glimpse(raw_data)
+
+# ---- Step 2: Train / Test Split ---------------------------------------------
+cat("Train rows:", nrow(train_data), "| Test rows:", nrow(test_data), "\n")
+head(train_data)
+head(test_data)
+
+# ---- Step 3: Returns Added --------------------------------------------------
+# OpCl = open-to-close, ClCl = close-to-close, ClOp = close-to-open (overnight)
+train_df %>%
+  dplyr::select(symbol, date, open, close, OpCl, ClCl, ClOp) %>%
+  head(20)
+
+# ---- Step 4: Rolling Stats — Pre-Kalman ------------------------------------
+pre_kalman <- train_df %>% add_rollers(window = 126)
+
+pre_kalman %>%
+  dplyr::filter(symbol == "XLE") %>%
+  dplyr::select(symbol, date, ClCl,
+                mean_32d, mean_126d,
+                vol_126d, sharpe_126d,
+                momentum_126d, corr_spy_126d) %>%
+  head(20)
+
+# ---- Step 5: After Kalman Smoothing — Before vs After -----------------------
+# Compare a single feature for one symbol to see how much smoothing is applied.
+dplyr::bind_cols(
+  pre_kalman %>%
+    dplyr::filter(symbol == "XLE") %>%
+    dplyr::select(date, pre_momentum  = momentum_126d,
+                        pre_sharpe    = sharpe_126d,
+                        pre_vol       = vol_126d),
+  baseline_features %>%
+    dplyr::filter(symbol == "XLE") %>%
+    dplyr::select(post_momentum = momentum_126d,
+                  post_sharpe   = sharpe_126d,
+                  post_vol      = vol_126d)
+) %>% head(30)
+
+# ---- Step 6: Monthly Snapshots ----------------------------------------------
+train_snapshots %>%
+  dplyr::select(symbol, date,
+                momentum_126d, vol_126d,
+                sharpe_126d, corr_spy_126d) %>%
+  head(30)
+
+cat("Rebalancing dates:", length(unique(train_snapshots$date)), "\n")
+
+# ---- Step 7: K Evaluation ---------------------------------------------------
+k_eval$metrics
+
+# ---- Step 8: Cluster Assignments at a Sample Date --------------------------
+sample_rebal    <- max(train_snapshots$date)
+sample_clusters <- cluster_sectors(train_snapshots, k = 3,
+                                   rebalance_date = sample_rebal)
+
+sample_clusters %>% dplyr::arrange(cluster)
+
+# ---- Step 9: Signals at Sample Date ----------------------------------------
+feature_cols_viewer <- c("momentum_126d", "vol_126d",
+                         "sharpe_126d",   "corr_spy_126d")
+
+sample_signals <- generate_signals(
+  snapshot_dat        = train_snapshots %>% dplyr::filter(date == sample_rebal),
+  cluster_assignments = sample_clusters,
+  window              = 126
+)
+
+sample_signals %>% dplyr::arrange(desc(composite))
+
+# ---- Step 10: Weights at Sample Date ----------------------------------------
+sample_weights <- construct_weights(sample_signals)
+
+sample_weights %>% dplyr::arrange(desc(weight))
+
+# ---- Step 11: Portfolio — Daily Weights × Sector Returns --------------------
+head(baseline_train$portfolio_df, 30)
+
+# Spot-check: weights should sum near 0 on any given day (dollar-neutral)
+baseline_train$portfolio_df %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(net_weight = sum(weight, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::summarise(mean_net = mean(net_weight), max_abs_net = max(abs(net_weight)))
+
+# ---- Step 12: Strategy Returns ----------------------------------------------
+head(baseline_train$strategy_returns_df, 20)
+
+cat(sprintf(
+  "Sharpe: %.2f | CumReturn: %.1f%% | MaxDD: %.1f%%\n",
+  baseline_train$sharpe,
+  baseline_train$cum_return * 100,
+  baseline_train$max_drawdown * 100
+))
 ```
