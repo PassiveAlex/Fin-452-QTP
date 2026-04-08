@@ -875,7 +875,7 @@ The pipeline consists of four main stages: (1) computation of rolling statistics
 
 The training period covers mid-2000 through December 2024. Testing runs from January 2025 through February 2026. Baseline parameters (window = 126, dW = 0.01, K = 3) were selected heuristically and later evaluated against a broader parameter grid.
 
----
+------------------------------------------------------------------------
 
 ## Trading Universe
 
@@ -936,7 +936,7 @@ universe_tbl %>%
   gt::tab_options(table.width = gt::pct(75))
 ```
 
----
+------------------------------------------------------------------------
 
 # Rationale
 
@@ -976,13 +976,13 @@ p_corr
 
 The correlation matrix confirms substantial co-movement across all sector ETFs, as expected given shared exposure to the broad equity market. Correlations are uniformly positive, with most pairs in the 0.6–0.9 range. Defensive sectors (XLU, XLRE, XLP) tend to correlate slightly less with cyclicals (XLK, XLY, XLE), which reflects their different factor sensitivities and provides some basis for relative positioning. A dollar-neutral portfolio will hedge out a large fraction of market-wide risk, but correlated drawdowns during severe market stress will still affect both long and short legs.
 
----
+------------------------------------------------------------------------
 
 # Assumptions
 
 The backtest results throughout this document rest on several simplifying assumptions that would not hold in live trading. Each omission tends to flatter the reported returns.
 
-**No transaction costs.** No commissions, exchange fees, or clearing costs are deducted from returns. Even small per-trade costs compound significantly over a 24-year backtest. At a conservative estimate of $5 per sector trade, monthly rebalancing across 11 sectors would incur over $16,000 in costs per year on a $1M book, before accounting for the short leg.
+**No transaction costs.** No commissions, exchange fees, or clearing costs are deducted from returns. Even small per-trade costs compound significantly over a 24-year backtest. At a conservative estimate of \$5 per sector trade, monthly rebalancing across 11 sectors would incur over \$16,000 in costs per year on a \$1M book, before accounting for the short leg.
 
 **No bid-ask spread.** All trades are assumed to execute at the prevailing closing price rather than the ask (for buys) or bid (for sells). The SPDR sector ETFs are highly liquid with spreads of 1–2 cents, so the per-trade impact is small, but it is non-zero and systematically omitted.
 
@@ -1002,7 +1002,7 @@ The backtest results throughout this document rest on several simplifying assump
 
 **Unlimited short availability.** The strategy assumes shares can always be borrowed to establish short positions. While SPDR sector ETFs rarely experience short squeezes or hard-to-borrow conditions, this assumption is not guaranteed.
 
----
+------------------------------------------------------------------------
 
 # Strategy
 
@@ -1010,7 +1010,7 @@ The backtest results throughout this document rest on several simplifying assump
 
 ```{mermaid}
 flowchart TD
-    A[CME / Yahoo Price Data] --> B[Pull & Align Returns Sector ETFs + SPY]
+    A[Yahoo Price Data] --> B[Pull & Align Returns Sector ETFs + SPY]
     B --> C[Feature Engineering MA · Vol · Sharpe · Momentum · Corr · Drawdown]
     C --> D[Kalman Smoothing Normalise → Local-Level Filter controlled by dW]
     D --> E[Monthly Snapshots Expanding-window normalise at each rebalance date]
@@ -1040,7 +1040,7 @@ The strategy pipeline has four stages:
 
 **4. Signal Construction and Weight Allocation:** A composite signal is computed per sector as the product of: (a) the continuous MA crossover magnitude `(short_MA - long_MA) / |long_MA|`, (b) a cluster confirmation score (fraction of cluster peers sharing the same directional signal), and (c) inverse volatility. Sectors with a positive composite are held long; negative composites are held short. Weights are proportional to composite magnitude within each side. The portfolio is dollar-neutral at every rebalance. A one-day execution lag is applied: signals observed at month-end close are acted on the following trading day.
 
----
+------------------------------------------------------------------------
 
 ## Kalman Filtering
 
@@ -1048,8 +1048,8 @@ The Kalman filter used here is a local-level model, sometimes called a random-wa
 
 The model has two equations. The state equation says that the true value at time t equals the true value at time t-1 plus a small random disturbance with variance dW. The observation equation says that what we observe equals the true state plus independent noise with variance dV. Written out:
 
-- State: μ_t = μ_{t-1} + w_t, where w_t ~ N(0, dW)
-- Observation: y_t = μ_t + v_t, where v_t ~ N(0, dV)
+-   State: μ_t = μ\_{t-1} + w_t, where w_t \~ N(0, dW)
+-   Observation: y_t = μ_t + v_t, where v_t \~ N(0, dV)
 
 At each time step, the filter produces an estimate of the true state by combining two sources of information: the prediction from the previous state, and the new observation. The relative weight given to each depends on the ratio dW/dV. When dW is small relative to dV, the filter treats observations as noisy and trusts the prediction more, producing a heavily smoothed output that changes slowly. When dW is large relative to dV, the filter trusts each new observation more and updates quickly, tracking the raw series closely.
 
@@ -1057,13 +1057,13 @@ In this implementation, dV is fixed at 1. Before filtering, each series is norma
 
 The filter runs strictly forward: each output value depends only on past observations. This makes it causal and prevents look-ahead bias. The trade-off is that an exponential moving average (EMA) applied to the rolling statistics would achieve comparable smoothing with a single interpretable decay parameter and no distributional assumptions. The Kalman approach is theoretically cleaner but adds complexity without a demonstrated empirical advantage in this specific context.
 
----
+------------------------------------------------------------------------
 
 ## Shorting and Dollar-Neutrality
 
 A short position profits when an asset's price falls. The strategy borrows shares of a sector ETF from a broker, sells them immediately at the current market price, and later repurchases them at a (hoped-for) lower price. The profit is the difference between the initial sale and the repurchase, minus the cost of borrowing. In the context of this strategy, a sector receives a negative weight when its composite signal is negative, indicating it is expected to underperform peers. Multiplying a negative weight by a negative return (the sector fell) produces a positive contribution to portfolio return.
 
-Dollar-neutrality means the total dollar value of long positions equals the total dollar value of short positions, resulting in zero net market exposure. In this implementation, long weights sum to +1 and short weights sum to -1 at every rebalancing date. The portfolio is simultaneously $1 long a basket of sector ETFs and $1 short another basket, for a net invested position of zero.
+Dollar-neutrality means the total dollar value of long positions equals the total dollar value of short positions, resulting in zero net market exposure. In this implementation, long weights sum to +1 and short weights sum to -1 at every rebalancing date. The portfolio is simultaneously \$1 long a basket of sector ETFs and \$1 short another basket, for a net invested position of zero.
 
 The primary benefit is market-beta removal. Because both the long and short legs hold sector ETFs with high pairwise correlation, broad market moves tend to affect both legs in the same direction and roughly the same magnitude, largely cancelling out. The portfolio profits only when the long sectors outperform the short sectors on a relative basis, regardless of whether the overall market goes up or down. This is why the strategy is described as a relative-value long-short strategy rather than a directional one.
 
@@ -1071,7 +1071,7 @@ Dollar-neutrality does not eliminate all risk. The correlation matrix shows that
 
 When all composite scores carry the same sign (for example, all sectors showing a positive trend signal in a broad bull market), a strict positive/negative split would leave one side empty. To handle this, the strategy applies a median split: sectors above the median composite score go long, sectors below go short. This ensures the portfolio is always dollar-neutral and always making a relative bet between stronger and weaker performers, even when the signal has a consistent directional bias.
 
----
+------------------------------------------------------------------------
 
 ## Signal Logic
 
@@ -1088,16 +1088,16 @@ The composite signal has three multiplicative components:
 The table below summarises how combinations of these components map to trade decisions and relative position sizes.
 
 | MA Signal | Cluster Confirmation | Volatility | Composite | Position |
-|---|---|---|---|---|
-| Short MA > long MA (uptrend) | High (peers agree) | Low | Large positive | **Long, high weight** |
-| Short MA > long MA (uptrend) | Low (peers disagree) | Any | Small positive | Long, reduced weight |
-| Short MA < long MA (downtrend) | High (peers agree) | Low | Large negative | **Short, high weight** |
-| Short MA < long MA (downtrend) | Low (peers disagree) | Any | Small negative | Short, reduced weight |
+|---------------|---------------|---------------|---------------|---------------|
+| Short MA \> long MA (uptrend) | High (peers agree) | Low | Large positive | **Long, high weight** |
+| Short MA \> long MA (uptrend) | Low (peers disagree) | Any | Small positive | Long, reduced weight |
+| Short MA \< long MA (downtrend) | High (peers agree) | Low | Large negative | **Short, high weight** |
+| Short MA \< long MA (downtrend) | Low (peers disagree) | Any | Small negative | Short, reduced weight |
 | All sectors same direction | N/A | Any | Median split applied | Top half long, bottom half short |
 
 A concrete example: XLE has a short MA above its long MA (positive trend), its cluster peers XLB and XLI share the same direction (confirmation ≈ 1.0), and it has below-average volatility. It receives a large positive composite and is assigned a high long weight. Meanwhile, XLC has a short MA below its long MA, its peers agree, but it has above-average volatility. It receives a moderate negative composite and is assigned a modest short weight.
 
----
+------------------------------------------------------------------------
 
 ## Clustering
 
@@ -1129,13 +1129,13 @@ The diagnostics suggest K = 3 as a reasonable baseline. The silhouette peaks the
 
 It is worth noting that with only eleven sectors, any clustering algorithm will produce coarse groupings. The marginal value of the clustering step over a manually-defined sector-group categorisation has not been rigorously tested here.
 
----
+------------------------------------------------------------------------
 
 # Performance
 
 The strategy was evaluated on two periods: a long in-sample training period (June 2000 – December 2024) and a short out-of-sample testing period (January 2025 – February 2026). Baseline parameters of window = 126, dW = 0.01, and K = 3 were used for both runs. These parameters were selected after observing training-period behaviour, so in-sample metrics should be interpreted cautiously.
 
----
+------------------------------------------------------------------------
 
 ## Training
 
@@ -1205,7 +1205,6 @@ p_sector_heatmap_train <- baseline_train$weights_df %>%
 plot_backtest(baseline_train, title = "Training Period — Strategy Performance")
 ```
 
-
 ```{r, "Training Chart B - Strategy vs SPY", echo = F, warning = F, message = F, include = F}
 plot(tick_train$cumeq, main = "Training — Strategy vs SPY")
 ```
@@ -1248,7 +1247,7 @@ The equity curve does show periods of gains, but these were offset by drawdowns 
 
 The SPY comparison makes the result starker. A long-only SPY position over the same period, despite living through two major crashes, significantly outperformed the strategy. The dollar-neutral design is intended to hedge market exposure, but it did not convert that hedge into a positive return; it simply removed market beta while the relative sector bets also failed to add value on net.
 
----
+------------------------------------------------------------------------
 
 ## Testing
 
@@ -1317,7 +1316,6 @@ plot_backtest(baseline_test, title = "Testing Period — Strategy Performance")
 plot(tick_test$cumeq, main = "Testing — Cumulative Equity")
 ```
 
-
 ```{r, "Testing Chart B - Strategy vs SPY", echo = F, warning = F, message = F, include = F}
 plot(tick_test$cumeq, main = "Testing — Strategy vs SPY")
 ```
@@ -1344,7 +1342,7 @@ The sector weight heatmap shows the model continued to rotate positions, which c
 
 The 14-month testing window is too short to draw statistical conclusions in isolation. But combined with the negative training result, there is no evidence from either period that the current signal construction generates a reliable edge.
 
----
+------------------------------------------------------------------------
 
 ## Strategy vs SPY
 
@@ -1421,7 +1419,7 @@ p_compare_test <- compare_df %>%
 
 The two panels show clearly how the strategy performed relative to a passive SPY position in each period. During training, SPY compounded substantially over the 24-year window, while the strategy's cumulative return drifted negative. During testing, both the strategy and SPY faced the 2025 drawdown period, but the SPY comparison makes plain that the dollar-neutral design did not provide the relative return needed to justify its complexity against a simple long-only benchmark.
 
----
+------------------------------------------------------------------------
 
 # Optimization
 
@@ -1524,7 +1522,7 @@ opt_heatmap
 
 The optimization results show whether losses are broadly consistent across parameter combinations or whether a robust region exists. If no coherent optimum appears in the surface, it suggests the returns are noise-driven rather than reflecting a stable underlying signal that happens to be misconfigured.
 
----
+------------------------------------------------------------------------
 
 # Lessons Learned
 
@@ -1534,7 +1532,7 @@ Pulling historical sector ETF data via `tidyquant` was operationally straightfor
 
 An error made in an early version of the returns code was using raw `close` prices for overnight return calculations rather than `adjusted` values. For a same-day `OpCl` return this is correct, but for `ClCl` (total daily return) and `ClOp` (overnight), `adjusted` close must be used to account for splits and dividends. This caused performance figures to look subtly wrong until caught. The fix was simple, but it cost diagnostic time.
 
----
+------------------------------------------------------------------------
 
 ## Strategy Complexity
 
@@ -1542,13 +1540,13 @@ The composite signal design went through several iterations. Starting with a pla
 
 The Kalman smoothing step is the most complex piece of the pipeline and arguably the least validated. The local-level model assumption (random-walk state) is convenient but not strongly motivated. An EMA-based alternative would have been simpler, more interpretable, and worth testing as a baseline before introducing the Kalman filter. The decision to jump to Kalman smoothing was driven partly by theoretical appeal rather than a demonstrated need.
 
----
+------------------------------------------------------------------------
 
 ## Clustering Utility
 
 Hierarchical clustering was chosen over K-means for its determinism (no random initialisation). This was the right call for reproducibility. However, the clustering's practical value is limited by the small universe size. With eleven sectors, K = 3 produces clusters of roughly three to four sectors each, and the cluster confirmation score does not vary much. In a larger universe (e.g., individual stocks), clustering would carry more information content.
 
----
+------------------------------------------------------------------------
 
 ## Out-of-Sample Evaluation
 
@@ -1556,13 +1554,13 @@ The most significant methodological limitation is the train/test split approach.
 
 The testing period is also too short (14 months) for statistically meaningful conclusions. Extending the dataset and running a rolling-window evaluation would be the correct next step before drawing any real conclusions about edge persistence.
 
----
+------------------------------------------------------------------------
 
 ## Parallel Computation
 
-The grid search parallelisation required more debugging than anticipated. Workers receiving serialised R function closures that retained large enclosing environments caused silent all-NA failures. The fix, creating clean function environments and explicitly exporting only the required objects, worked but added non-trivial complexity. For a 72-combination grid, the sequential implementation would have been simpler and only marginally slower. The engineering overhead of correct parallelisation is worth paying at larger grid sizes, but for smaller searches, simplicity wins.
+The grid search parallelisation required more debugging than anticipated. Workers receiving serialised R function closures that retained large enclosing environments caused silent all-NA failures. The fix, creating clean function environments and explicitly exporting only the required objects, worked but added non-trivial complexity. For a 940-combination grid, the sequential implementation would have been simpler and only marginally slower. The engineering overhead of correct parallelisation is worth paying at larger grid sizes, but for smaller searches, simplicity wins.
 
----
+------------------------------------------------------------------------
 
 # Conclusion
 
@@ -1574,7 +1572,7 @@ The academic literature provides solid support for sector-level momentum as a co
 
 The pipeline itself is structurally sound: the backtest avoids obvious look-ahead bias, the dollar-neutral construction is implemented correctly, and the evaluation is thorough. The engineering is fine. The trading signal is not. That distinction matters for what comes next: the code does not need to be rewritten, but the signal logic does.
 
----
+------------------------------------------------------------------------
 
 # Appendix: Performance Statistics {.appendix}
 
